@@ -1,6 +1,6 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
-import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import { legacyExecutionNeedsReconciliation, legacyTerminalHoldSettleable } from "./legacy-execution-recovery.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -106,4 +106,45 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, stopReason: "cancelled" } },
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
+});
+
+const terminalFailure = {
+  runtimeMode: "legacy", status: "failed",
+  contextSnapshot: { issueId: "issue-1" }, resultJson: {},
+};
+
+it.each([
+  ["openhands_exception", "failed"],
+  ["process_lost", "failed"],
+  ["openhands_agent_server_unreachable", "failed"],
+  ["cancelled", "cancelled"],
+])("settles a terminal legacy hold left by %s (%s)", (_errorCode, status) => {
+  expect(legacyTerminalHoldSettleable({ ...terminalFailure, status })).toBe(true);
+});
+
+it("keeps a legacy hold armed while the run is not terminal", () => {
+  for (const status of ["running", "queued", "interrupted", "succeeded"]) {
+    expect(legacyTerminalHoldSettleable({ ...terminalFailure, status })).toBe(false);
+  }
+});
+
+it("keeps a legacy hold armed while any process identity survives", () => {
+  for (const patch of [
+    { processPid: 123 }, { processGroupId: 123 }, { processStartedAt: new Date() },
+  ]) expect(legacyTerminalHoldSettleable({ ...terminalFailure, ...patch })).toBe(false);
+});
+
+it("keeps a legacy hold armed when workspace repair is still owed", () => {
+  expect(legacyTerminalHoldSettleable({ ...terminalFailure, resultJson: {
+    workspaceRestoreFailure: "restore_unsafe_archive" } })).toBe(false);
+  expect(legacyTerminalHoldSettleable({ ...terminalFailure, resultJson: {
+    workspaceRestoreFailure: "restore_failed",
+    workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1" },
+  } })).toBe(false);
+});
+
+it("does not settle native runs or runs without an issue", () => {
+  expect(legacyTerminalHoldSettleable({ ...terminalFailure, runtimeMode: "native" })).toBe(false);
+  expect(legacyTerminalHoldSettleable({ ...terminalFailure, contextSnapshot: {} })).toBe(false);
+  expect(legacyTerminalHoldSettleable({ ...terminalFailure, contextSnapshot: undefined })).toBe(false);
 });

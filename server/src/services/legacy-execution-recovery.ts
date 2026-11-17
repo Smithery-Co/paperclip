@@ -346,3 +346,69 @@ export async function recordRequiredWorkspaceRestoreFailure(db: Db, run: Run, ev
     recordRestoreFailureOnly: true, patch: { resultJson: evidence }, workspaceRestoreSource: source,
   });
 }
+
+/** A legacy run that already reached a terminal failure can leave an automatic
+ * no-replay hold armed forever. settleInterruptedNativeBootstrap only recognizes
+ * server_shutdown_interrupted, so adapter crashes, lost processes and unreachable
+ * agent servers never clear their own hold and every later wakeup is deferred
+ * against a recovery action that will not advance. Release that hold once the
+ * durable records prove the run stopped and left nothing to replay. */
+export function legacyTerminalHoldSettleable(
+  run: Pick<Run, "runtimeMode" | "status" | "resultJson"> &
+    Partial<Pick<Run, "contextSnapshot" | "processPid" | "processGroupId" | "processStartedAt">>,
+): boolean {
+  if (run.runtimeMode !== "legacy") return false;
+  const issueId = run.contextSnapshot?.issueId;
+  if (typeof issueId !== "string" || !issueId) return false;
+  if (run.status !== "failed" && run.status !== "cancelled") return false;
+  if (run.processPid || run.processGroupId || run.processStartedAt) return false;
+  if (hasWorkspaceRestoreFailure(run.resultJson)) return false;
+  if (hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  return true;
+}
+
+export async function settleTerminalLegacyExecutionHold(
+  db: Db, input: { run: Run },
+): Promise<boolean> {
+  const run = input.run;
+  if (!legacyTerminalHoldSettleable(run)) return false;
+  const issueId = run.contextSnapshot!.issueId as string;
+  return db.transaction(async tx => {
+    const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).for("update");
+    const [locked] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId))).for("update");
+    if (!task || !locked || locked.status !== run.status) return false;
+    if (locked.processPid || locked.processGroupId || locked.processStartedAt) return false;
+    const [native] = await tx.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)).limit(1);
+    const [lease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+      or(isNull(environmentLeases.releasedAt), eq(environmentLeases.status, "pending_cleanup"), eq(environmentLeases.cleanupStatus, "failed")),
+    )).limit(1);
+    if (native || lease) return false;
+    const holds = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
+      eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+      sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+      sql`not (${issueRecoveryActions.evidence} ? 'executionReconciliation')`,
+      sql`coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'`,
+      or(inArray(issueRecoveryActions.status, ["active", "escalated"]), and(
+        eq(issueRecoveryActions.status, "resolved"), eq(issueRecoveryActions.outcome, "blocked"),
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'policy' = 'preserve_without_replay_v1'`,
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      )),
+    )).for("update");
+    if (!holds.length) return false;
+    const now = new Date();
+    await tx.update(issueRecoveryActions).set({
+      evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"allowed"'::jsonb, false) ||
+        ${JSON.stringify({ terminalExecutionSettledAt: now.toISOString() })}::jsonb`,
+      updatedAt: now,
+    }).where(inArray(issueRecoveryActions.id, holds.map(hold => hold.id)));
+    await logActivity(tx as unknown as Db, { companyId: run.companyId, actorType: "system", actorId: "system",
+      action: "issue.recovery_action_replay_allowed", entityType: "issue", entityId: task.id, agentId: run.agentId, runId: run.id,
+      details: { reason: "terminal_legacy_execution_no_replay", runStatus: run.status, errorCode: run.errorCode ?? null,
+        recoveryActionIds: holds.map(hold => hold.id) },
+    });
+    return true;
+  });
+}
+

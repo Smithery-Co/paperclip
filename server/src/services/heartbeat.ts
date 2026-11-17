@@ -275,6 +275,7 @@ import {
 
 import {
   settleInterruptedNativeBootstrap,
+  settleTerminalLegacyExecutionHold,
 } from "./legacy-execution-recovery.js";
 import {
   adapterExecutionControls,
@@ -3836,6 +3837,17 @@ export function heartbeatService(
           latestRun = await settleInterruptedNativeBootstrap(db, { run: latestRun,
             providerDispatchStarted: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld,
           }) ?? latestRun;
+        }
+        if (latestRun?.runtimeMode === "legacy" &&
+            (latestRun.status === "failed" || latestRun.status === "cancelled")) {
+          // Terminal legacy failures (adapter crash, lost process, unreachable
+          // agent server) otherwise keep their no-replay hold armed forever and
+          // defer every later wakeup. Release it once cleanup is proven.
+          try {
+            await settleTerminalLegacyExecutionHold(db, { run: latestRun });
+          } catch (err) {
+            logger.warn({ err, runId: latestRun.id }, "failed to settle terminal legacy execution hold");
+          }
         }
         if (latestRun?.status === "cancelled" && !nativeDispatchStarted && !nativeOwnershipHeld &&
             (latestRun.runtimeMode === "native" ||
