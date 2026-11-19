@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import path from "node:path";
+import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { setExpensiveWorkspaceGitExecutor } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { runWorkspaceGitProcess } from "@paperclipai/adapter-utils/workspace-git-stream";
 import { HttpError } from "../errors.js";
@@ -260,10 +262,49 @@ function abortError(workspaceHash: string): WorkspaceGitScanError {
   );
 }
 
+/**
+ * Workspace worktrees live under `<instanceRoot>/projects`, which the server
+ * may inspect while running as a different uid than the one that created the
+ * checkout. Git then refuses with "dubious ownership" and diagnostics report
+ * the worktree as missing. Allow only the managed roots, never `*`.
+ */
+export function workspaceSafeDirectoryArgs(): string[] {
+  let instanceRoot: string;
+  try {
+    instanceRoot = resolvePaperclipInstanceRoot();
+  } catch {
+    return [];
+  }
+  const roots = new Set([path.resolve(instanceRoot), path.resolve(instanceRoot, "projects")]);
+  return [...roots].flatMap((root) => ["-c", `safe.directory=${root}`]);
+}
+
+function isGitBinary(binary: string): boolean {
+  return path.basename(binary) === "git" || path.basename(binary) === "git.exe";
+}
+
 function createSpawnRunner(input: { gitBinary: string; gitArgsPrefix: readonly string[] }): WorkspaceGitRunner {
+  // Only the real git binary understands `-c`; tests and alternate runners
+  // inject a non-git executable with their own argv contract.
+  const supportsSafeDirectory = isGitBinary(input.gitBinary);
   return async (runInput) => {
     try {
-      return await runWorkspaceGitProcess({ ...runInput, ...input, cwd: runInput.canonicalWorkspacePath });
+      // Allow the exact checkout as well as the managed roots. A checkout can
+      // be owned by a different uid than the server (root-run diagnostics),
+      // and Git only trusts an exact path or `*`.
+      const gitArgsPrefix = supportsSafeDirectory
+        ? [
+            ...input.gitArgsPrefix,
+            "-c",
+            `safe.directory=${runInput.canonicalWorkspacePath}`,
+          ]
+        : input.gitArgsPrefix;
+      return await runWorkspaceGitProcess({
+        ...runInput,
+        ...input,
+        gitArgsPrefix,
+        cwd: runInput.canonicalWorkspacePath,
+      });
     } catch (error) {
       const candidate = error as { code?: WorkspaceGitScanErrorCode; details?: Record<string, unknown> };
       throw new WorkspaceGitScanError(
@@ -320,9 +361,11 @@ export class WorkspaceGitOperationScheduler {
     this.maxStderrBytes = clampInteger(options.maxStderrBytes, DEFAULT_OUTPUT_BYTES, 1, 128 * 1024 * 1024);
     this.warningIntervalMs = clampInteger(options.warningIntervalMs, DEFAULT_WARNING_INTERVAL_MS, 1, 60 * 60_000);
     this.now = options.now ?? Date.now;
+    const gitBinary = options.gitBinary ?? "git";
     this.runner = options.runner ?? createSpawnRunner({
-      gitBinary: options.gitBinary ?? "git",
-      gitArgsPrefix: options.gitArgsPrefix ?? [],
+      gitBinary,
+      gitArgsPrefix:
+        options.gitArgsPrefix ?? (isGitBinary(gitBinary) ? workspaceSafeDirectoryArgs() : []),
     });
   }
 
