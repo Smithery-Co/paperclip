@@ -113,7 +113,10 @@ import { createGitHubWorkspaceDeliveryResolver, type GitHubWorkspaceDeliveryReso
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { createIssueGitRemoteAuthProvider } from "./git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
-import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import {
+  workspaceGitOperationScheduler,
+  workspaceSafeDirectoryArgs,
+} from "./workspace-git-operation-scheduler.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import {
   listCurrentRuntimeServicesForExecutionWorkspaces,
@@ -578,7 +581,7 @@ async function hasGitMarkerInPathOrAncestors(start: string) {
 }
 
 async function runGit(args: string[], cwd: string) {
-  return await execFileAsync("git", ["-C", cwd, ...args], { cwd });
+  return await execFileAsync("git", [...workspaceSafeDirectoryArgs(), "-C", cwd, ...args], { cwd });
 }
 
 async function runExpensiveGitStatus(input: {

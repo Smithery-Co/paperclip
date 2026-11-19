@@ -66,6 +66,7 @@ import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { warnAboutUnresolvedCommitReferences } from "../services/commit-reference-guard.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -16775,6 +16776,19 @@ export function issueRoutes(
           ? await db.transaction(tx => addCommentAndReceipt(tx as unknown as Db))
           : await addCommentAndReceipt(db);
         await issueReferencesSvc.syncComment(comment.id);
+        // Completion comments also arrive through PATCH ?comment=; the same
+        // warn-only audit-trail guard applies to them.
+        await warnAboutUnresolvedCommitReferences({
+          db,
+          issue: {
+            id: issue.id,
+            companyId: issue.companyId,
+            identifier: issue.identifier,
+            executionWorkspaceId: issue.executionWorkspaceId,
+            projectWorkspaceId: issue.projectWorkspaceId,
+          },
+          comment: { id: comment.id, body: comment.body },
+        });
         await externalObjectsSvc.syncCommentSafely(comment.id);
         if (
           issue.assigneeAgentId &&
@@ -21030,6 +21044,20 @@ export function issueRoutes(
 
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
+      // Warn-only audit-trail guard: a completion comment that cites a commit
+      // absent from this issue's repository gets a system notice, but the
+      // comment itself is always accepted.
+      await warnAboutUnresolvedCommitReferences({
+        db,
+        issue: {
+          id: currentIssue.id,
+          companyId: currentIssue.companyId,
+          identifier: currentIssue.identifier,
+          executionWorkspaceId: currentIssue.executionWorkspaceId,
+          projectWorkspaceId: currentIssue.projectWorkspaceId,
+        },
+        comment: { id: comment.id, body: comment.body },
+      });
       res.status(201).json(comment);
     },
   );
