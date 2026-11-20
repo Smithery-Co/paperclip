@@ -714,6 +714,19 @@ export function obsoleteExecutionConversationHold() {
 }
 
 /**
+ * The `statusVersion` a recovery hold's Blocked projection recorded for this
+ * run, if any. Every failure receipt uses the same `{ runId, statusVersion }`
+ * shape, so a later pass can tell whether its block is still the current one.
+ */
+function recordedBlockStatusVersion(value: unknown, runId: string): number | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const block = value as Record<string, unknown>;
+  if (block.runId !== runId) return null;
+  const version = typeof block.statusVersion === "string" ? Number(block.statusVersion) : block.statusVersion;
+  return typeof version === "number" && Number.isFinite(version) ? version : null;
+}
+
+/**
  * Failed execution is a system responsibility, not a user questionnaire. After
  * automatic recovery is ruled out, preserve evidence and stop without replay.
  * This is NOT evidence that an external action succeeded or never happened.
@@ -868,13 +881,37 @@ export async function settleUnrecoverableExecutions(
             !coordinator.failureDetail?.replacementDenied)
         )
           return;
+        // A hold only owns the status while the Blocked projection it recorded
+        // is still current. A user/agent transition bumps statusVersion, so a
+        // re-derived hold must not write Blocked over that newer decision.
+        // Receipts are read across every action for this run: a re-derived hold
+        // is a new row and carries no history of its own (THE-374).
+        const siblingHolds = await tx
+          .select({ evidence: issueRecoveryActions.evidence })
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.companyId, run.companyId),
+            eq(issueRecoveryActions.sourceIssueId, task.id),
+            sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+          ));
+        const recordedBlockVersions = siblingHolds
+          .flatMap(({ evidence }) => [
+            evidence.nativeFailureBlock,
+            evidence.legacyCancellationBlock,
+            evidence.nativeBootstrapFailureBlock,
+          ])
+          .map(block => recordedBlockStatusVersion(block, run.id))
+          .filter((version): version is number => version !== null);
+        const statusMovedSinceBlock = recordedBlockVersions.length > 0
+          && !recordedBlockVersions.includes(Number(task.statusVersion));
         const current =
           !isSupersededConversationRun(task, run) &&
           action.returnOwnerAgentId !== null &&
           task.assigneeAgentId === action.returnOwnerAgentId &&
           !["done", "cancelled"].includes(task.status) &&
           (!task.executionRunId || task.executionRunId === run.id) &&
-          (!task.checkoutRunId || task.checkoutRunId === run.id);
+          (!task.checkoutRunId || task.checkoutRunId === run.id) &&
+          !statusMovedSinceBlock;
         // Exact recovery is ruled out. Unless the cause is the person's, the
         // task continues in a fresh run from its last saved work instead of
         // waiting for a person.
@@ -913,6 +950,12 @@ export async function settleUnrecoverableExecutions(
           // Only a transition owned by this failure grants a recovery receipt.
           // An already-blocked task may have a separate human/dependency hold.
           if (task.status !== "blocked" && run.runtimeMode === "native") {
+            nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
+          }
+          // Legacy failures record the same receipt shape, so the next pass can
+          // recognise a user/agent transition instead of re-blocking. A legacy
+          // cancellation keeps its own receipt below.
+          if (task.status !== "blocked" && run.runtimeMode === "legacy" && run.status !== "cancelled") {
             nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
           }
           if (task.status !== "blocked" && run.runtimeMode === "legacy" && run.status === "cancelled") {
