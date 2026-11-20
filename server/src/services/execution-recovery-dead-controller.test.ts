@@ -72,4 +72,38 @@ describe("automatic recovery after a drained legacy controller", () => {
     expect(run!.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
     expect(await isInterruptedNativePreparation(db, run!)).toBe(controller === "exited");
   });
+
+  it("leaves a task a person moved after a legacy failure block instead of re-blocking it", async () => {
+    const companyId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
+    const finishedAt = new Date(Date.now() - 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Legacy hold", issuePrefix: `L${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner", status: "idle" });
+    // The first pass settled this exact failure and its Blocked projection is
+    // still the recorded status at version 4.
+    await db.insert(issues).values({ id: issueId, companyId, title: "Ship notes", status: "blocked",
+      assigneeAgentId: agentId, statusVersion: 4 });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, runtimeMode: "legacy",
+      status: "failed", errorCode: "provider_quota", startedAt: new Date(finishedAt.getTime() - 600_000),
+      finishedAt, contextSnapshot: { issueId }, runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } } });
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+      status: "resolved", outcome: "blocked", resolvedAt: finishedAt, ownerType: "board", returnOwnerAgentId: agentId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Reconcile the stopped execution.",
+      evidence: { runId, automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked" },
+        nativeFailureBlock: { runId, statusVersion: 4 } } });
+    // An older release re-derived the same incident into a fresh active hold.
+    const [reDerived] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: agentId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Reconcile the stopped execution.", evidence: { runId } }).returning();
+    // A person moved the task after the failure: the trigger advances statusVersion.
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.statusVersion).toBe(5);
+
+    await settleUnrecoverableExecutions(db);
+
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "todo" });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, reDerived!.id)))[0])
+      .toMatchObject({ status: "resolved", outcome: "cancelled" });
+  });
 });

@@ -676,6 +676,13 @@ const support = externalDatabaseUrl
       const [settled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actions[0]!.id));
       expect(settled).toMatchObject({ status: "resolved", outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" } } });
 
+      // Re-deriving the same settled incident must reuse that decision instead
+      // of opening a fresh hold that re-blocks the task (THE-374).
+      await terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"] });
+      expect(await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, source.issueId))).toHaveLength(1);
+      expect((await db.select().from(issues).where(eq(issues.id, source.issueId)))[0]).toMatchObject({ status: "blocked" });
+
       expect(legacyExecutionNeedsReconciliation({ ...run, status: "failed", resultJson: { errorFamily: "provider_quota" } })).toBe(true);
       expect(legacyExecutionNeedsReconciliation({ ...run, status: "failed", resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })).toBe(false);
       expect(legacyExecutionNeedsReconciliation({ ...run, status: "failed", scheduledRetryAttempt: 2, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })).toBe(true);
