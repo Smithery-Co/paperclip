@@ -105,6 +105,9 @@ Core fields:
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds
 - graceSec (number, optional): SIGTERM grace period in seconds
+- streamIdleTimeoutSec (number, optional): stop a run whose OpenCode stream emits nothing \
+for this many seconds; defaults to 900, 0 disables. A stalled provider call otherwise \
+waits for the full \`timeoutSec\` and reports "execution timed out".
 
 Notes:
 - OpenCode supports multiple providers and models. Use \
@@ -118,4 +121,9 @@ Notes:
 - When \`dangerouslySkipPermissions\` is enabled, Paperclip injects a temporary \
   runtime config with \`permission=allow\` so headless runs do \
   not stall on approval prompts.
+- A provider failure that OpenCode records only in its own log (for example an \
+  exhausted free-tier quota) leaves the CLI running with no output on stdout or \
+  stderr. \`streamIdleTimeoutSec\` bounds that silence: the adapter stops the run \
+  and reports \`opencode_stream_stalled\` instead of waiting for \`timeoutSec\`. \
+  Raise it for agents whose single tool calls legitimately run that long.
 `;
