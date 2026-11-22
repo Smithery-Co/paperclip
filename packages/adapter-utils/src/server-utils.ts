@@ -87,7 +87,8 @@ export interface TerminalResultCleanupEvidence {
   forceKilled: boolean;
 }
 
-interface RunningProcess {
+/** A spawned child tracked by run id. Exported so callers of `runningProcesses` can name it. */
+export interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;

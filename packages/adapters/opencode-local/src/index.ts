@@ -103,6 +103,9 @@ Core fields:
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds
 - graceSec (number, optional): SIGTERM grace period in seconds
+- streamIdleTimeoutSec (number, optional): stop a run whose OpenCode stream emits nothing \
+for this many seconds; defaults to 900, 0 disables. A stalled provider call otherwise \
+waits for the full \`timeoutSec\` and reports "execution timed out".
 
 Notes:
 - OpenCode supports multiple providers and models. Use \
