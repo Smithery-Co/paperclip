@@ -4,16 +4,38 @@ import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActi
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { readProcessStartedAt } from "./hot-restart.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { listServerAdapters } from "../adapters/registry.js";
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
 // replay the action itself, so those adapters retain their recovery contract.
+// First-party harnesses are listed here because the recovery predicates run as
+// SQL and cannot consult the adapter registry; external and plugin adapters opt
+// in with `supportsConversationContinuation` instead (see conversationAdapterTypes).
 export const CONVERSATION_ADAPTER_TYPES = [
   "claude_local", "codex_local", "cursor", "gemini_local", "opencode_local",
   "pi_local", "grok_local", "kimi_local", "hermes_local",
 ] as const;
 
+/**
+ * Adapter types that accept a conversation turn: the first-party list plus any
+ * registered adapter that declares `supportsConversationContinuation`.
+ *
+ * Recovery holds are derived from adapter capability, not from the adapter's
+ * name. An adapter missing from the first-party list (a plugin such as
+ * `openhands`) used to leave every terminal run with an execution hold that no
+ * user message could settle, because both the blocker predicate and
+ * `admitExplicitNativeContinuation` consult this set.
+ */
+export function conversationAdapterTypes(): readonly string[] {
+  const declared = listServerAdapters()
+    .filter((adapter) => adapter.supportsConversationContinuation === true)
+    .map((adapter) => adapter.type);
+  if (declared.length === 0) return CONVERSATION_ADAPTER_TYPES;
+  return [...new Set([...CONVERSATION_ADAPTER_TYPES, ...declared])];
+}
+
 export function isConversationAdapter(adapterType: string): boolean {
-  return (CONVERSATION_ADAPTER_TYPES as readonly string[]).includes(adapterType);
+  return conversationAdapterTypes().includes(adapterType);
 }
 
 export const CONVERSATION_CONTINUATION_POLICY = "continue_conversation_v1";
@@ -30,14 +52,14 @@ export function claimedAdapterType(run: Pick<typeof heartbeatRuns.$inferSelect, 
 
 function conversationRunPredicate() {
   return or(
-    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES]),
+    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, [...conversationAdapterTypes()]),
     sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
     sql`exists (
       select 1 from ${heartbeatRunEvents}
       where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
         and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
         and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
-        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES])}
+        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, [...conversationAdapterTypes()])}
     )`,
   );
 }

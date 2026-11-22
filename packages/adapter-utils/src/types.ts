@@ -515,6 +515,15 @@ export interface ServerAdapterModule {
   /** Selected harness can resume its conversation with this run's tool bindings. */
   supportsToolRefreshOnResume?: boolean | ((config: Record<string, unknown>) => boolean);
   supportsLocalAgentJwt?: boolean;
+  /**
+   * Declares that a run of this adapter can be continued with a new user turn:
+   * the provider keeps the conversation, so an interrupted or cancelled run has
+   * a conversation to come back to instead of an unreplayable action hold.
+   * `CONVERSATION_ADAPTER_TYPES` stays as the first-party default; external and
+   * plugin adapters (for example `openhands`) must opt in here, otherwise their
+   * terminal runs leave an execution hold that no user message can settle.
+   */
+  supportsConversationContinuation?: boolean;
   /** How this adapter receives Paperclip's run-scoped control tools. */
   runtimeToolDelivery?: AdapterRuntimeToolDelivery;
   models?: AdapterModel[];
