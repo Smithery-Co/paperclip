@@ -55,6 +55,7 @@ import {
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
+import { createOpenCodeStreamGuard, DEFAULT_STREAM_IDLE_TIMEOUT_SEC, type OpenCodeStreamStall } from "./stall.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -349,6 +350,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
     const timeoutSec = adapterExecutionTimeout.timeoutSec;
     const graceSec = asNumber(config.graceSec, 20);
+    // 0 disables the guard; negative values are treated as disabled too so a typo
+    // cannot silently re-enable a one-second budget.
+    const streamIdleTimeoutSec = asNumber(
+      config.streamIdleTimeoutSec,
+      DEFAULT_STREAM_IDLE_TIMEOUT_SEC,
+    );
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,
@@ -674,6 +681,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             costStatus: parsed.usageComplete || parsed.costUsd != null ? undefined : "unpriced",
             usageBasis: "per_run", provider, biller: resolveOpenCodeBiller(accountingEnv, provider), billingType: apiKeyBillingType(provider, accountingEnv), model, complete: false };
         });
+        // A provider call that fails inside OpenCode can leave the CLI alive with
+        // nothing on either stream until the execution timeout fires. Watch for that
+        // silence so the run stops with an attributable reason instead of burning the
+        // whole budget.
+        const streamGuard = createOpenCodeStreamGuard({
+          runId,
+          idleTimeoutSec: streamIdleTimeoutSec,
+          graceSec,
+          onLog,
+        });
         const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
           onProcessStopped: providerStop.beginInvocation(),
           // Keep a long sandbox run off the synchronous command HTTP request.
@@ -687,10 +704,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           graceSec,
           onSpawn,
           onRuntimeProgress: ctx.onRuntimeProgress,
-          onLog: accountingLog,
+          onLog: async (stream, chunk) => {
+            streamGuard.note(stream, chunk);
+            await accountingLog(stream, chunk);
+          },
           runLogTail: paperclipBridge?.runLogTail,
           settleRunDisposition: paperclipBridge?.settleRunDisposition,
         });
+        streamGuard.stop();
+        const streamStall = streamGuard.stall();
         // Parse any unterminated final record before deciding whether its usage
         // is complete. A clean exit alone cannot turn absent counters into zero.
         await accountingLog.flush();
@@ -707,7 +729,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           parsed.usageComplete = retained.usageComplete;
           parsed.costUsd = retained.costUsd;
         }
-        return { proc, rawStderr: proc.stderr, parsed };
+        return { proc, rawStderr: proc.stderr, parsed, streamStall };
       };
 
       const toResult = (
@@ -715,6 +737,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
           rawStderr: string;
           parsed: ReturnType<typeof parseOpenCodeJsonl>;
+          streamStall: OpenCodeStreamStall | null;
         },
         clearSessionOnMissingSession = false,
       ): AdapterExecutionResult => {
@@ -737,6 +760,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             // timer fired, and provider stderr is not safe exception text.
             errorMessage: "OpenCode execution timed out",
             resultJson: { adapterExecutionTimeout },
+            clearSession: clearSessionOnMissingSession,
+          };
+        }
+
+        // The stream guard stopped this run, so the timeout message above would be
+        // wrong: the run ended early, on purpose, because nothing was happening.
+        if (attempt.streamStall) {
+          return {
+            exitCode: attempt.proc.exitCode ?? 1,
+            signal: attempt.proc.signal,
+            timedOut: false,
+            usageComplete: false,
+            usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
+            usageBasis: "per_run",
+            provider: parseModelProvider(model || null),
+            biller: resolveOpenCodeBiller(accountingEnv, parseModelProvider(model || null)),
+            model,
+            billingType: apiKeyBillingType(parseModelProvider(model || null), accountingEnv),
+            costUsd: attempt.parsed.costUsd,
+            costStatus: attempt.parsed.usageComplete || attempt.parsed.costUsd != null ? undefined : "unpriced",
+            errorMessage: attempt.streamStall.message,
+            errorCode: "opencode_stream_stalled",
+            resultJson: {
+              adapterExecutionTimeout,
+              streamStall: {
+                silenceMs: attempt.streamStall.silenceMs,
+                budgetMs: attempt.streamStall.budgetMs,
+                lastEventType: attempt.streamStall.lastEventType,
+                lastActivityAt: attempt.streamStall.lastActivityAt,
+              },
+            },
+            summary: attempt.parsed.summary,
             clearSession: clearSessionOnMissingSession,
           };
         }
