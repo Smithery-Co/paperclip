@@ -2,6 +2,7 @@ import { hasPendingRunCleanup } from "../execution-blocker.js";
 import { runOwnerFenceHeldSql } from "../remote-workspace-writer-hold.js";
 import { AGENT_DIRECTORY_BUSY_ERROR_CODE, AGENT_DIRECTORY_BUSY_MAX_DEFERRALS, AGENT_DIRECTORY_BUSY_RETRY_REASON, AGENT_DIRECTORY_BUSY_RETRY_WAKE_REASON, agentDirectoryBusyRetryDelayMs, type AgentDirectoryPreparationDeferral } from "./agent-directory-busy.js";
 import { isInterruptedNativePreparation } from "../cancelled-native-startup.js";
+import { PROVIDER_TRANSPORT_FAILURE_CODE } from "../recovery/provider-transport-failure.js";
 import { isPreDispatchExecutionWaitVerified } from "../pre-dispatch-execution-wait.js";
 import { notifyIssueAttentionRetentionWork } from "../retention-work-notifications.js";
 import { normalizeAgentNameKey } from "../agent-name-key.js";
@@ -433,6 +434,9 @@ function isRetryableInteractionContinuationInfrastructureFailure(
     run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE ||
     run.errorCode === "process_lost" ||
     run.errorCode === CONTROLLER_LEASE_LOST_FAILURE_CODE ||
+    // A provider request that died at the socket/TLS layer never produced
+    // response bytes, so the replay repeats no generated work.
+    run.errorCode === PROVIDER_TRANSPORT_FAILURE_CODE ||
     run.errorCode === PLUGIN_WORKER_UNAVAILABLE_CODE ||
     run.errorCode === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE ||
     run.errorCode === REPOSITORY_CATALOG_UNAVAILABLE_CODE ||

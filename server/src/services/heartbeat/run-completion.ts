@@ -57,6 +57,7 @@ import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitrat
 import { conversationTurnPresentsAnswer } from "../native-runtime/native-governance.js";
 import { readAcceptedTaskContinuationSummary } from "../heartbeat-run-summary.js";
 import { SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON } from "../recovery/stranded-notice.js";
+import { resolveProviderFailureErrorCode } from "../recovery/provider-transport-failure.js";
 import { MAX_TURN_CONTINUATION_RETRY_REASON, allowsIssueInteractionWake, isResolvedInteractionContinuationWakeContext } from "../../modules/run-dispatch/index.js";
 import { ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS } from "../issue-tree-control.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
@@ -516,6 +517,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           : outcome === "failed"
             ? (adapterResult.errorCode ??
               recordedResponsibleUserDenialCode ??
+              resolveProviderFailureErrorCode({
+                explicitErrorCode: null,
+                errorMessage: runErrorMessage,
+              }) ??
               "adapter_failed")
             : null;
     // A generic code alone does not say what failed; record a bounded cause.
@@ -1330,6 +1335,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       recordedResponsibleUserDenialCode ??
       nativeTerminalFailureCode ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
+      resolveProviderFailureErrorCode({
+        explicitErrorCode: null,
+        errorMessage: err instanceof Error ? err.message : String(err),
+      }) ??
       "adapter_failed";
     // Only a `storage_unavailable` run gets a storage wait. Under any other code
     // (for example a native recovery hold that keeps the files without

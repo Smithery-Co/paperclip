@@ -40,6 +40,7 @@ import {
   LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE, hasLiveLegacyController, legacyControllerBootId, liveLegacyControllerExpiresAt } from "../legacy-controller-lease.js";
+import { PROVIDER_TRANSPORT_FAILURE_CODE } from "./provider-transport-failure.js";
 import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { NATIVE_STATUS_COMMITTER_ACTOR_ID } from "../issue-rewake-throttle.js";
@@ -608,6 +609,9 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "claude_transient_upstream",
   "provider_quota",
   "timeout",
+  // A provider request died at the socket/TLS layer before any response bytes,
+  // so a retry replays no generated work.
+  PROVIDER_TRANSPORT_FAILURE_CODE,
   // The host lost run ownership before dispatch; no provider work began.
   CONTROLLER_LEASE_LOST_FAILURE_CODE,
 ]);
