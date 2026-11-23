@@ -485,6 +485,7 @@ describeEmbeddedPostgres("issue review verdict policy", () => {
       type: "agent",
       id: seeded.requesterAgentId,
       runId,
+      relayedUserId: "board-user",
       mixedIdentity: true,
     });
   });
@@ -507,5 +508,222 @@ describeEmbeddedPostgres("issue review verdict policy", () => {
       issue: seeded.issue,
       interaction: { id: "unbound", createdByUserId: "board-user" },
     })).resolves.toBe(true);
+  });
+
+  // THE-415: the persisted requester is written by the transition that created
+  // it. When the runner omits `X-Paperclip-Run-Id` the write path cannot see
+  // the live run and stamps the credential holder, so a persisted `user` must
+  // not shadow an agent execution named by the same transition's snapshot.
+  async function seedPersistedUserWithAgentExecution() {
+    const seeded = await seedReview("not_creator");
+    const requesterRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: requesterRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.requesterAgentId,
+      status: "succeeded",
+      issueId: seeded.issue.id,
+    });
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        authorizationReason: "allow_board_actor",
+        reviewRequester: { type: "user", id: "board-user", runId: null },
+        _previous: { status: "in_progress", executionRunId: requesterRunId },
+      },
+    });
+    return { ...seeded, requesterRunId };
+  }
+
+  it("does not let a persisted user requester shadow the agent execution snapshot", async () => {
+    const seeded = await seedPersistedUserWithAgentExecution();
+    await expect(resolveIssueReviewRequester(db, seeded.issue)).resolves.toMatchObject({
+      type: "agent",
+      id: seeded.requesterAgentId,
+      runId: seeded.requesterRunId,
+      relayedUserId: "board-user",
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.requesterAgentId },
+    })).rejects.toMatchObject<Partial<HttpError>>({
+      status: 403,
+      details: expect.objectContaining({
+        code: "review_policy_denied",
+        policy: "not_creator",
+        allowedActor: "writer_other_than_review_requester",
+      }),
+    });
+  });
+
+  it("still admits a different agent when a persisted user shadowed an execution", async () => {
+    const seeded = await seedPersistedUserWithAgentExecution();
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.peerAgentId },
+    })).resolves.toBeUndefined();
+  });
+
+  it("fails closed when a persisted user names an execution that cannot be resolved", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        reviewRequester: { type: "user", id: "board-user", runId: null },
+        _previous: {
+          status: "in_progress",
+          executionRunId: randomUUID(),
+          executionAgentNameKey: "deleted-agent",
+        },
+      },
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.peerAgentId },
+    })).rejects.toMatchObject<Partial<HttpError>>({
+      status: 403,
+      details: expect.objectContaining({
+        code: "review_policy_denied",
+        reason: "agent_execution_unresolved",
+      }),
+    });
+  });
+
+  it("honours a persisted user requester when the transition names no agent execution", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        reviewRequester: { type: "user", id: "board-user", runId: null },
+        _previous: { status: "in_progress" },
+      },
+    });
+    await expect(resolveIssueReviewRequester(db, seeded.issue)).resolves.toMatchObject({
+      type: "user",
+      id: "board-user",
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.peerAgentId },
+    })).resolves.toBeUndefined();
+  });
+
+  it("persists the relayed person alongside a mixed-identity requester", async () => {
+    const seeded = await seedReview("not_creator");
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.requesterAgentId,
+      status: "running",
+      issueId: seeded.issue.id,
+    });
+    const persisted = await buildIssueReviewRequesterForTransition(db, {
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      agentId: null,
+      runId,
+    });
+    expect(persisted).toEqual({
+      type: "agent",
+      id: seeded.requesterAgentId,
+      runId,
+      relayedUserId: "board-user",
+      mixedIdentity: true,
+    });
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        reviewRequester: persisted,
+        _previous: { status: "in_progress" },
+      },
+    });
+    await expect(resolveIssueReviewRequester(db, seeded.issue)).resolves.toMatchObject({
+      type: "agent",
+      id: seeded.requesterAgentId,
+      runId,
+      relayedUserId: "board-user",
+    });
+    // The relayed person's confirmation still belongs to this review.
+    await expect(isIssueReviewVerdictInteraction(db, {
+      issue: seeded.issue,
+      interaction: { id: "unbound", createdByUserId: "board-user" },
+    })).resolves.toBe(true);
+  });
+
+  it("attributes a board-credentialed write from the pre-update snapshot when the run id is missing", async () => {
+    const seeded = await seedReview("not_creator");
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.requesterAgentId,
+      status: "running",
+      issueId: seeded.issue.id,
+    });
+    await expect(buildIssueReviewRequesterForTransition(db, {
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      agentId: null,
+      runId: null,
+      existing: { executionRunId: runId, executionAgentNameKey: "requester" },
+    })).resolves.toEqual({
+      type: "agent",
+      id: seeded.requesterAgentId,
+      runId,
+      relayedUserId: "board-user",
+      mixedIdentity: true,
+    });
+  });
+
+  it("refuses to record a persisted user when the snapshot names an unresolvable execution", async () => {
+    const seeded = await seedReview("not_creator");
+    await expect(buildIssueReviewRequesterForTransition(db, {
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      agentId: null,
+      runId: null,
+      existing: { executionAgentNameKey: "deleted-agent" },
+    })).resolves.toBeNull();
+  });
+
+  it("does not record an agent transition that carries no agent id as a person", async () => {
+    const seeded = await seedReview("not_creator");
+    await expect(buildIssueReviewRequesterForTransition(db, {
+      companyId: seeded.companyId,
+      actorType: "agent",
+      actorId: seeded.requesterAgentId,
+      agentId: null,
+      runId: null,
+    })).resolves.toBeNull();
   });
 });

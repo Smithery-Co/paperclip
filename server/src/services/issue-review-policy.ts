@@ -119,6 +119,44 @@ function agentRequester(
   };
 }
 
+/** The pre-update execution snapshot a transition records under `_previous`. */
+interface ExecutionEvidence {
+  executionRunId: string | null;
+  checkoutRunId: string | null;
+  executionAgentNameKey: string | null;
+}
+
+function readExecutionEvidence(previous: Record<string, unknown> | null): ExecutionEvidence {
+  return {
+    executionRunId: readString(previous?.executionRunId),
+    checkoutRunId: readString(previous?.checkoutRunId),
+    executionAgentNameKey: readString(previous?.executionAgentNameKey),
+  };
+}
+
+function namesAnAgentExecution(evidence: ExecutionEvidence): boolean {
+  return Boolean(evidence.executionRunId || evidence.checkoutRunId || evidence.executionAgentNameKey);
+}
+
+async function resolveAgentFromExecution(
+  db: Db,
+  companyId: string,
+  evidence: ExecutionEvidence,
+): Promise<{ agentId: string; runId: string | null } | null> {
+  for (const runId of [evidence.executionRunId, evidence.checkoutRunId]) {
+    if (!runId) continue;
+    const agentId = await resolveAgentIdForRun(db, companyId, runId);
+    if (agentId) return { agentId, runId };
+  }
+  if (evidence.executionAgentNameKey) {
+    const agentId = await resolveAgentIdForNameKey(db, companyId, evidence.executionAgentNameKey);
+    if (agentId) {
+      return { agentId, runId: evidence.executionRunId ?? evidence.checkoutRunId };
+    }
+  }
+  return null;
+}
+
 async function resolveRequesterFromSignals(
   db: Db,
   signals: ReviewRequesterSignals,
@@ -126,6 +164,7 @@ async function resolveRequesterFromSignals(
   const details = readRecord(signals.details);
   const reviewInteractionId = readString(details?.reviewInteractionId);
   const previous = readRecord(details?._previous);
+  const executionEvidence = readExecutionEvidence(previous);
 
   const persisted = readRecord(details?.reviewRequester);
   const persistedType = persisted?.type === "agent" || persisted?.type === "user"
@@ -133,6 +172,16 @@ async function resolveRequesterFromSignals(
     : null;
   const persistedId = readString(persisted?.id);
   if (persistedType && persistedId) {
+    // A persisted `user` is only trustworthy when the transition does not name
+    // an agent execution. When the runner omits `X-Paperclip-Run-Id` the write
+    // path cannot see the live run, so it stamps the credential holder even
+    // though an agent performed the transition (THE-228). Trusting that stamp
+    // would let the executing agent review its own work.
+    if (persistedType === "user" && namesAnAgentExecution(executionEvidence)) {
+      const executing = await resolveAgentFromExecution(db, signals.companyId, executionEvidence);
+      if (!executing) return { kind: "ambiguous", reason: "agent_execution_unresolved" };
+      return agentRequester(executing.agentId, executing.runId, reviewInteractionId, persistedId);
+    }
     return {
       kind: "resolved",
       requester: {
@@ -156,28 +205,13 @@ async function resolveRequesterFromSignals(
 
   // Execution metadata is the only evidence that a board-credentialed write was
   // actually performed by an agent run.
-  const executionRunId = readString(previous?.executionRunId);
-  const checkoutRunId = readString(previous?.checkoutRunId);
-  const executionAgentNameKey = readString(previous?.executionAgentNameKey);
-  if (executionRunId || checkoutRunId || executionAgentNameKey) {
+  if (namesAnAgentExecution(executionEvidence)) {
     // The recorded person is the identity the run presented, not an independent
     // writer, so keep it attached to the agent attribution.
     const relayedUserId = signals.actorType === "user" ? actorId : null;
-    for (const runId of [executionRunId, checkoutRunId]) {
-      if (!runId) continue;
-      const agentId = await resolveAgentIdForRun(db, signals.companyId, runId);
-      if (agentId) return agentRequester(agentId, runId, reviewInteractionId, relayedUserId);
-    }
-    if (executionAgentNameKey) {
-      const agentId = await resolveAgentIdForNameKey(db, signals.companyId, executionAgentNameKey);
-      if (agentId) {
-        return agentRequester(
-          agentId,
-          executionRunId ?? checkoutRunId,
-          reviewInteractionId,
-          relayedUserId,
-        );
-      }
+    const executing = await resolveAgentFromExecution(db, signals.companyId, executionEvidence);
+    if (executing) {
+      return agentRequester(executing.agentId, executing.runId, reviewInteractionId, relayedUserId);
     }
     // The row says a person asked for review while its own snapshot names an
     // agent that no longer resolves. Refuse to guess which writer the verdict
@@ -285,7 +319,10 @@ export async function resolveIssueReviewRequester(
  *
  * A write made with a person's credential while a run is executing is stamped
  * with that run's agent and flagged as mixed identity, so the gate and the
- * audit trail agree about the writer instead of recording the person.
+ * audit trail agree about the writer instead of recording the person. The
+ * live run is not always visible here — the runner omits `X-Paperclip-Run-Id`
+ * on some paths — so the issue's pre-update execution snapshot is used as the
+ * remaining evidence.
  */
 export async function buildIssueReviewRequesterForTransition(
   db: Db,
@@ -295,32 +332,53 @@ export async function buildIssueReviewRequesterForTransition(
     actorId: string;
     agentId?: string | null;
     runId?: string | null;
+    /** The issue's execution snapshot from before the status transition. */
+    existing?: {
+      executionRunId?: string | null;
+      checkoutRunId?: string | null;
+      executionAgentNameKey?: string | null;
+    } | null;
   },
 ): Promise<IssueReviewRequesterRecord | null> {
   const agentId = readString(input.agentId);
   const runId = readString(input.runId);
-  if (input.actorType === "agent" && agentId) {
-    return { type: "agent", id: agentId, runId };
+  if (input.actorType === "agent") {
+    // An agent write without an id is unattributable; recording it as a person
+    // would fail open on the review policy.
+    return agentId ? { type: "agent", id: agentId, runId } : null;
   }
   const actorId = readString(input.actorId);
   if (!actorId) return null;
-  if (input.actorType === "user" && runId) {
-    const runAgentId = await resolveAgentIdForRun(db, input.companyId, runId);
-    if (runAgentId) {
-      logger.warn(
-        {
-          companyId: input.companyId,
-          actorId,
-          runId,
-          agentId: runAgentId,
-          reason: "board_credential_with_agent_run",
-        },
-        "review transition written with a board credential during an agent run; attributing it to the run's agent",
-      );
-      return { type: "agent", id: runAgentId, runId, mixedIdentity: true };
-    }
+
+  const evidence = readExecutionEvidence({
+    executionRunId: runId ?? readString(input.existing?.executionRunId),
+    checkoutRunId: readString(input.existing?.checkoutRunId),
+    executionAgentNameKey: readString(input.existing?.executionAgentNameKey),
+  });
+  if (!namesAnAgentExecution(evidence)) {
+    return { type: "user", id: actorId, runId: null };
   }
-  return { type: "user", id: actorId, runId: null };
+  const executing = await resolveAgentFromExecution(db, input.companyId, evidence);
+  // Names an agent execution that no longer resolves: persist nothing so the
+  // reader fails closed and asks for a fresh transition.
+  if (!executing) return null;
+  logger.warn(
+    {
+      companyId: input.companyId,
+      actorId,
+      runId: executing.runId,
+      agentId: executing.agentId,
+      reason: "board_credential_with_agent_run",
+    },
+    "review transition written with a board credential during an agent run; attributing it to the run's agent",
+  );
+  return {
+    type: "agent",
+    id: executing.agentId,
+    runId: executing.runId,
+    relayedUserId: actorId,
+    mixedIdentity: true,
+  };
 }
 
 export async function isIssueReviewVerdictInteraction(

@@ -15717,7 +15717,9 @@ export function issueRoutes(
       const persistReviewActivityTransactionally =
         enteringReviewRequested || Boolean(reviewInteractionId);
       // Persist the requester with the transition so no later read has to infer
-      // it from the execution snapshot.
+      // it from the execution snapshot. The actor's run id is not always present
+      // (the runner omits `X-Paperclip-Run-Id` on some paths), so hand over the
+      // pre-update snapshot as the remaining evidence of who performed this write.
       const reviewRequester = enteringReviewRequested
         ? await buildIssueReviewRequesterForTransition(db, {
             companyId: existing.companyId,
@@ -15725,6 +15727,7 @@ export function issueRoutes(
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
+            existing,
           })
         : null;
 
