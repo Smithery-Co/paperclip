@@ -13,6 +13,7 @@ import {
   companyMemberships,
   heartbeatRuns,
   instanceUserRoles,
+  issues,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import {
@@ -115,6 +116,122 @@ const responsibleUserMembershipsStatement = preparedStatement(db => responsibleU
   companyId: sql.placeholder("companyId"),
   userId: sql.placeholder("userId"),
 }).prepare("responsible_user_memberships"));
+
+const BOARD_CREDENTIAL_MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const ISSUE_ID_PATH = /\/issues\/([0-9a-f][0-9a-f-]{35})(?:\/|$)/i;
+
+/**
+ * A run can reach the board with the human's board key in two ways: it supplies
+ * X-Paperclip-Run-Id, or it silently reuses the human's key while the issue it
+ * mutates is still locked to a live run (executionRunId/checkoutRunId). The
+ * second shape is what run c17d873b produced: its final status PATCH carried no
+ * run-id header, but the issue still held that run's execution lock. Detect
+ * both so the guard cannot be bypassed simply by dropping the header.
+ */
+async function findActiveRunIdForBoardMutation(
+  db: Db,
+  input: { headerRunId: string | null; path: string },
+): Promise<{ runId: string; source: "run_id_header" | "issue_execution_lock" } | null> {
+  const headerRunId = normalizeOptionalString(input.headerRunId);
+  if (headerRunId) return { runId: headerRunId, source: "run_id_header" };
+
+  const issueId = input.path.match(ISSUE_ID_PATH)?.[1] ?? null;
+  if (!issueId || !isUuidLike(issueId)) return null;
+  const issue = await db
+    .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+    .from(issues)
+    .where(eq(issues.id, issueId))
+    .then((rows) => rows[0] ?? null);
+  if (!issue) return null;
+  for (const runId of [issue.executionRunId, issue.checkoutRunId]) {
+    if (!runId || !isUuidLike(runId)) continue;
+    const run = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (run?.status === "running") return { runId, source: "issue_execution_lock" };
+  }
+  return null;
+}
+
+/**
+ * A board API key authenticated a mutating request under an agent run identity.
+ * That is a mixed identity: a run is reaching the board with the human's board
+ * key instead of its own run JWT. Keep the run-JWT path authoritative and
+ * refuse the write fail-closed, whether or not the run is still live. The
+ * warning and audit row use the same signal THE-408 stamps as mixedIdentity so
+ * operators can correlate this denial with the review-gate refusal.
+ */
+async function refuseBoardCredentialWithAgentRun(
+  db: Db,
+  input: {
+    companyIds: string[];
+    boardKeyId: string;
+    userId: string;
+    runId: string;
+    runIdSource: "run_id_header" | "issue_execution_lock";
+    method: string;
+    url: string;
+  },
+) {
+  const run = isUuidLike(input.runId)
+    ? await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, input.runId))
+        .then((rows) => rows[0] ?? null)
+    : null;
+  const activeRun = run?.status === "running";
+  logger.warn(
+    {
+      boardApiKeyId: input.boardKeyId,
+      userId: input.userId,
+      runId: input.runId,
+      runIdSource: input.runIdSource,
+      activeRun,
+      method: input.method,
+      url: input.url,
+    },
+    "board_credential_with_agent_run: refused board-key mutation under an agent run identity",
+  );
+  const companyId = input.companyIds[0] ?? null;
+  if (companyId) {
+    try {
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "user",
+        actorId: input.userId,
+        responsibleUserId: input.userId,
+        action: "auth.board_credential_with_agent_run_refused",
+        entityType: "heartbeat_run",
+        entityId: input.runId,
+        ...(run ? { runId: input.runId } : {}),
+        details: {
+          boardApiKeyId: input.boardKeyId,
+          runId: input.runId,
+          runIdSource: input.runIdSource,
+          activeRun,
+          method: input.method,
+          url: input.url,
+          authorizationReason: "board_credential_with_agent_run",
+          mixedIdentity: true,
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, runId: input.runId, boardApiKeyId: input.boardKeyId },
+        "Failed to persist board-credential/run-id refusal audit",
+      );
+    }
+  }
+  return forbidden("A board API key cannot mutate the board while an agent run is active", {
+    code: "board_credential_with_agent_run",
+    boardApiKeyId: input.boardKeyId,
+    runId: input.runId,
+    runIdSource: input.runIdSource,
+  });
+}
 
 async function loadResponsibleUserMemberships(
   db: Db,
@@ -382,6 +499,25 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     if (boardKey) {
       const access = await boardAuth.resolveBoardAccess(boardKey.userId);
       if (access.user) {
+        if (BOARD_CREDENTIAL_MUTATING_METHODS.has(req.method)) {
+          const runIdentity = await findActiveRunIdForBoardMutation(db, {
+            headerRunId: normalizeOptionalString(runIdHeader),
+            path: req.path,
+          });
+          if (runIdentity) {
+            const refusal = await refuseBoardCredentialWithAgentRun(db, {
+              companyIds: access.companyIds,
+              boardKeyId: boardKey.id,
+              userId: boardKey.userId,
+              runId: runIdentity.runId,
+              runIdSource: runIdentity.source,
+              method: req.method,
+              url: req.originalUrl,
+            });
+            next(refusal);
+            return;
+          }
+        }
         await boardAuth.touchBoardApiKey(boardKey.id);
         req.actor = {
           type: "board",
