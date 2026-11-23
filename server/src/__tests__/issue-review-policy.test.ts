@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, createDb, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { HttpError } from "../errors.js";
 import {
   assertIssueReviewVerdictActorAllowed,
+  buildIssueReviewRequesterForTransition,
   isIssueReviewVerdictInteraction,
+  resolveIssueReviewRequester,
 } from "../services/issue-review-policy.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -25,6 +27,7 @@ describeEmbeddedPostgres("issue review verdict policy", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -242,5 +245,267 @@ describeEmbeddedPostgres("issue review verdict policy", () => {
       issue: seeded.issue,
       actor: { type: "user", id: "board-user" },
     })).resolves.toBeUndefined();
+  });
+
+  // THE-228 / THE-399: the in_review transition was written under the human's
+  // board credential while an agent run executed, so the row says `user` but
+  // its own execution snapshot names the agent. The author must not slip
+  // through on the credential type mismatch.
+  async function seedBoardCredentialedAgentTransition() {
+    const seeded = await seedReview("not_creator");
+    const machineRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: machineRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.requesterAgentId,
+      status: "succeeded",
+      issueId: seeded.issue.id,
+    });
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user-YPXEEXR9",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        authorizationReason: "allow_board_actor",
+        _previous: {
+          status: "in_progress",
+          executionRunId: machineRunId,
+          checkoutRunId: machineRunId,
+          executionAgentNameKey: "requester",
+        },
+      },
+    });
+    return { ...seeded, machineRunId };
+  }
+
+  it("resolves a board-credentialed transition to the executing agent", async () => {
+    const seeded = await seedBoardCredentialedAgentTransition();
+    await expect(resolveIssueReviewRequester(db, seeded.issue)).resolves.toMatchObject({
+      type: "agent",
+      id: seeded.requesterAgentId,
+      runId: seeded.machineRunId,
+      relayedUserId: "board-user-YPXEEXR9",
+    });
+  });
+
+  it("blocks the executing agent's own verdict on a board-credentialed transition", async () => {
+    const seeded = await seedBoardCredentialedAgentTransition();
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.requesterAgentId },
+    })).rejects.toMatchObject<Partial<HttpError>>({
+      status: 403,
+      details: expect.objectContaining({
+        code: "review_policy_denied",
+        policy: "not_creator",
+        allowedActor: "writer_other_than_review_requester",
+      }),
+    });
+  });
+
+  it("still admits a different agent after a board-credentialed transition", async () => {
+    const seeded = await seedBoardCredentialedAgentTransition();
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.peerAgentId },
+    })).resolves.toBeUndefined();
+  });
+
+  it("falls back to the agent name key when the run row does not resolve", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        authorizationReason: "allow_board_actor",
+        _previous: {
+          status: "in_progress",
+          executionRunId: randomUUID(),
+          executionAgentNameKey: "requester",
+        },
+      },
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.requesterAgentId },
+    })).rejects.toMatchObject<Partial<HttpError>>({
+      status: 403,
+      details: expect.objectContaining({ code: "review_policy_denied" }),
+    });
+  });
+
+  it("fails closed when agent execution metadata cannot be resolved to an agent", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        authorizationReason: "allow_board_actor",
+        _previous: {
+          status: "in_progress",
+          executionRunId: randomUUID(),
+          executionAgentNameKey: "deleted-agent",
+        },
+      },
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.peerAgentId },
+    })).rejects.toMatchObject<Partial<HttpError>>({
+      status: 403,
+      details: expect.objectContaining({
+        code: "review_policy_denied",
+        reason: "agent_execution_unresolved",
+      }),
+    });
+  });
+
+  it("blocks a genuine board requester's own agent from the verdict", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        authorizationReason: "allow_board_actor",
+        _previous: { status: "in_progress" },
+      },
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.requesterAgentId, relayedUserId: "board-user" },
+    })).rejects.toMatchObject<Partial<HttpError>>({
+      status: 403,
+      details: expect.objectContaining({
+        code: "review_policy_denied",
+        reason: "mixed_identity",
+      }),
+    });
+  });
+
+  it("admits distinct principals and an unrelated agent's relayed identity", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        authorizationReason: "allow_board_actor",
+        _previous: { status: "in_progress" },
+      },
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "user", id: "another-person" },
+    })).resolves.toBeUndefined();
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.peerAgentId, relayedUserId: "another-person" },
+    })).resolves.toBeUndefined();
+  });
+
+  it("persists the requester on a new transition instead of reinterpreting the snapshot", async () => {
+    const seeded = await seedReview("not_creator");
+    const persisted = await buildIssueReviewRequesterForTransition(db, {
+      companyId: seeded.companyId,
+      actorType: "agent",
+      actorId: seeded.requesterAgentId,
+      agentId: seeded.requesterAgentId,
+      runId: null,
+    });
+    expect(persisted).toEqual({ type: "agent", id: seeded.requesterAgentId, runId: null });
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "agent",
+      actorId: seeded.requesterAgentId,
+      agentId: seeded.requesterAgentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        reviewRequester: persisted,
+        _previous: { status: "in_progress" },
+      },
+    });
+    await expect(resolveIssueReviewRequester(db, seeded.issue)).resolves.toMatchObject({
+      type: "agent",
+      id: seeded.requesterAgentId,
+    });
+    await expect(assertIssueReviewVerdictActorAllowed(db, {
+      issue: seeded.issue,
+      actor: { type: "agent", id: seeded.requesterAgentId },
+    })).rejects.toMatchObject<Partial<HttpError>>({
+      status: 403,
+      details: expect.objectContaining({ code: "review_policy_denied" }),
+    });
+  });
+
+  it("persists mixed identity when a board credential writes during a run", async () => {
+    const seeded = await seedReview("not_creator");
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.requesterAgentId,
+      status: "running",
+      issueId: seeded.issue.id,
+    });
+    await expect(buildIssueReviewRequesterForTransition(db, {
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      agentId: null,
+      runId,
+    })).resolves.toEqual({
+      type: "agent",
+      id: seeded.requesterAgentId,
+      runId,
+      mixedIdentity: true,
+    });
+  });
+
+  it("keeps an unattributable transition a review verdict so the policy still applies", async () => {
+    const seeded = await seedReview("not_creator");
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: seeded.issue.id,
+      details: {
+        status: "in_review",
+        _previous: { status: "in_progress", executionAgentNameKey: "deleted-agent" },
+      },
+    });
+    await expect(isIssueReviewVerdictInteraction(db, {
+      issue: seeded.issue,
+      interaction: { id: "unbound", createdByUserId: "board-user" },
+    })).resolves.toBe(true);
   });
 });

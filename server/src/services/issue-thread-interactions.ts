@@ -564,7 +564,11 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
   if (!isReviewVerdict) return;
 
   const verdictActor = actor.agentId
-    ? { type: "agent" as const, id: actor.agentId }
+    ? {
+        type: "agent" as const,
+        id: actor.agentId,
+        relayedUserId: actor.relayedHumanUserId ?? null,
+      }
     : actor.userId
       ? { type: "user" as const, id: actor.userId }
       : null;

@@ -405,6 +405,7 @@ import { getExternalChannelBindingSummary } from "../services/chat-channel-bindi
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
+  buildIssueReviewRequesterForTransition,
   isIssueReviewVerdictInteraction,
   resolveIssueReviewRequester,
 } from "../services/issue-review-policy.js";
@@ -15715,6 +15716,17 @@ export function issueRoutes(
         existing.status !== "in_review" && updateFields.status === "in_review";
       const persistReviewActivityTransactionally =
         enteringReviewRequested || Boolean(reviewInteractionId);
+      // Persist the requester with the transition so no later read has to infer
+      // it from the execution snapshot.
+      const reviewRequester = enteringReviewRequested
+        ? await buildIssueReviewRequesterForTransition(db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType === "agent" ? "agent" : "user",
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+          })
+        : null;
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -16048,6 +16060,7 @@ export function issueRoutes(
               authorizationReason: issueMutationAuthorizationReason,
               changes,
               ...(reviewInteractionId ? { reviewInteractionId } : {}),
+              ...(reviewRequester ? { reviewRequester } : {}),
               ...(commentBody ? { source: "comment" } : {}),
               ...(resumeRequested === true
                 ? { resumeIntent: true, followUpRequested: true }
@@ -16441,6 +16454,7 @@ export function issueRoutes(
             authorizationReason: issueMutationAuthorizationReason,
             changes: issueChanges,
             ...(reviewInteractionId ? { reviewInteractionId } : {}),
+            ...(reviewRequester ? { reviewRequester } : {}),
             ...(commentBody ? { source: "comment" } : {}),
             ...(resumeRequested === true
               ? { resumeIntent: true, followUpRequested: true }
