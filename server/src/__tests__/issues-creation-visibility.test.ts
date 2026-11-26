@@ -59,6 +59,33 @@ describeEmbeddedPostgres("issue creation visibility", () => {
     await request(app).get(`/api/companies/${other.companyId}/issues?includeAgentCreatedTasks=false`).expect(403);
   });
 
+  it("reaches an agent-created task by identifier when agent-created tasks are hidden", async () => {
+    const { companyId, userId, actor } = await seedCompanyWithBoardAccess(ctx.db, "Identifier lookup");
+    const [agent] = await ctx.db.insert(agents).values({ companyId, name: "Worker", role: "engineer", adapterType: "process" }).returning();
+    await ctx.db.insert(issues).values([
+      { companyId, title: "Release checklist", identifier: "ACME-1", status: "todo", originKind: "manual", createdByUserId: userId, updatedAt: new Date(2026, 9, 13) },
+      { companyId, title: "Release checklist automation", identifier: "ACME-445", status: "todo", originKind: "manual", createdByAgentId: agent!.id, updatedAt: new Date(2026, 9, 14) },
+    ]);
+    const app = routeApp(ctx.db, actor, issueRoutes);
+    const path = `/api/companies/${companyId}/issues`;
+
+    // Content search keeps honouring the creation-visibility filter.
+    for (const view of ["", "&view=compact"]) {
+      const content = await request(app).get(`${path}?includeAgentCreatedTasks=false&q=Release${view}`).expect(200);
+      expect(content.body.map((issue: { identifier: string }) => issue.identifier)).toEqual(["ACME-1"]);
+    }
+
+    // Typing an identifier is navigation, so the hidden task still comes back.
+    for (const q of ["ACME-445", "acme445", "acme 445", "445"]) {
+      for (const view of ["", "&view=compact"]) {
+        const found = await request(app)
+          .get(`${path}?includeAgentCreatedTasks=false&q=${encodeURIComponent(q)}${view}`)
+          .expect(200);
+        expect(found.body.map((issue: { identifier: string }) => issue.identifier)).toContain("ACME-445");
+      }
+    }
+  });
+
   it("preserves participation but excludes routine ownership and read-only activity", async () => {
     const { companyId, userId, actor } = await seedCompanyWithBoardAccess(ctx.db, "Inbox participation");
     const ids = Object.fromEntries(["scheduled", "commented", "assigned", "manual", "read", "touched", "channelScheduled", "channelCommented", "channelManual"].map((name) => [name, randomUUID()]));

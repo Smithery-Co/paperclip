@@ -26,12 +26,31 @@ export function parseTaskSearch(text: string) {
   // A copied/typed task identifier is navigation, never a fuzzy number match.
   const identifier = /^([a-z][a-z0-9]*)[- ](\d+)$/i.exec(normalizedQuery) ?? /^([a-z]+)(\d+)$/i.exec(normalizedQuery);
   const identifierQuery = identifier ? `${identifier[1]}-${identifier[2]}` : normalizedQuery;
+  // A query that is only a number, or an identifier shape ("acme-445",
+  // "acme445", "acme 445"), is looked up as an identifier rather than filtered
+  // like content search. See taskIdentifierLookupCondition.
+  const identifierLookup = /^(?:\d+|[a-z][a-z0-9]*[- ]?\d+)$/i.test(normalizedQuery);
   const patterns = tokens.map((token) => `%${escapeTaskSearchPattern(token)}%`);
   const containsPattern = `%${escapeTaskSearchPattern(phrase)}%`;
   const startsWithPattern = `${escapeTaskSearchPattern(phrase)}%`;
-  return { normalizedQuery, terms, tokens, phrase, identifierQuery, patterns, containsPattern, startsWithPattern };
+  return { normalizedQuery, terms, tokens, phrase, identifierQuery, identifierLookup, patterns, containsPattern, startsWithPattern };
 }
 export type TaskSearch = ReturnType<typeof parseTaskSearch>;
+
+/**
+ * Identifier lookups are navigation, not content search.
+ *
+ * Boards hide agent-created tasks by default. Applying that filter to an
+ * identifier lookup makes the search look broken: typing a task number the
+ * user can see in the board returns nothing at all, with no hint that a filter
+ * removed it. Identifier-shaped queries ("445", "acme-445") therefore also
+ * match the task identifier, which the caller ORs into the creation-visibility
+ * condition so ranked content matches still respect the filter.
+ */
+export function taskIdentifierLookupCondition(search: TaskSearch): SQL<boolean> {
+  if (!search.identifierLookup) return sql`false`;
+  return sql<boolean>`issues.identifier ILIKE ${`%${escapeTaskSearchPattern(search.identifierQuery)}%`}`;
+}
 
 function taskSearchAny(field: SQL, search: TaskSearch): SQL<boolean> {
   return search.patterns.length === 0 ? sql`false`

@@ -53,7 +53,7 @@ import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
-import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
+import { parseTaskSearch, taskIdentifierLookupCondition, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
 import { loadRunBoundIssue } from "./issue-creation-source.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
@@ -8598,8 +8598,20 @@ export function issueService(db: Db) {
       }
       if (filters?.afterId) conditions.push(gt(issues.id, filters.afterId));
       if (filters?.readCondition) conditions.push(filters.readCondition);
+      const rawSearch = filters?.q?.trim() ?? "";
+      const hasSearch = rawSearch.length > 0;
+      const taskSearch = parseTaskSearch(rawSearch);
       const creationCondition = creationVisibilityCondition(companyId, filters);
-      if (creationCondition) conditions.push(creationCondition);
+      if (creationCondition) {
+        // Identifier lookups are navigation: `445` or `acme-445` must reach the
+        // task even when agent-created tasks are hidden, otherwise the search
+        // silently returns nothing. Content matches still respect the filter.
+        conditions.push(
+          taskSearch.identifierLookup
+            ? or(creationCondition, taskIdentifierLookupCondition(taskSearch))!
+            : creationCondition,
+        );
+      }
       const assigneeAgentFilter = parseIssueAssigneeAgentFilter(
         filters?.assigneeAgentId,
       );
@@ -8623,9 +8635,6 @@ export function issueService(db: Db) {
         filters?.includeBlockedInboxAttention === true;
       const includeLiveDescendantSummary =
         filters?.includeLiveDescendantSummary === true;
-      const rawSearch = filters?.q?.trim() ?? "";
-      const hasSearch = rawSearch.length > 0;
-      const taskSearch = parseTaskSearch(rawSearch);
       // Rank page ids from the user's participation set, then load full rows
       // only for that page (see IssueFilters.touchedCandidates).
       const participationCandidates = filters?.touchedCandidates === "participation"
