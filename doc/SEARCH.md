@@ -10,6 +10,7 @@ context to explain each match.
 | Intent | Good result | Failure |
 |---|---|---|
 | Known task ID | Exact ID first, case-insensitive; accept `PAP-42`, `pap42`, `PAP 42` | A mention or neighboring ID beats the task |
+| Known task ID while agent-created tasks are hidden | The identifier lookup also matches the task ID, so the typed ID still finds the task | Typing the ID of a visible task returns nothing |
 | Remembered title | Exact title, phrase, then all title words in any order | A recent comment mentioning those words beats the title |
 | Several concepts | Every meaningful query term contributes, including short terms such as API/UI | A task matches only one common word |
 | Exact phrase | Quoted text stays together and literal | Quotes silently behave like OR or fuzzy search |
@@ -78,6 +79,12 @@ Typo matching runs only when no literal match satisfies the requested filters.
 It never guesses task numbers, loosens a quoted phrase or drops a short query
 term. Alphabetic terms of one to three characters must begin a word, so `UI`
 does not match `build`, while incomplete longer words still support typeahead.
+
+An identifier-shaped query (`PAP-42`, `pap42`, `42`) is navigation, not
+content search. It also matches the task identifier directly, so the default
+"show agent-created tasks" visibility filter cannot hide the task whose number
+the user typed. Company, privacy and explicit project/status/assignee filters
+still apply.
 
 Ranking uses disjoint bands: exact ID, ID prefix, exact title, title phrase,
 all title terms, all task-text terms, all thread terms, then title typo recovery.

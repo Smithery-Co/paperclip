@@ -16,4 +16,9 @@ describe("task search query intent", () => {
     expect(parseTaskSearch("T123-42").identifierQuery).toBe("t123-42");
     expect(parseTaskSearch("PAP-420").identifierQuery).toBe("pap-420");
   });
+
+  it("flags identifier lookups so filters cannot swallow them", () => {
+    for (const q of ["42", "PAP-42", "pap42", "PAP 42"]) expect(parseTaskSearch(q).identifierLookup).toBe(true);
+    for (const q of ["release", "42 ms latency", "deploy the api"]) expect(parseTaskSearch(q).identifierLookup).toBe(false);
+  });
 });
